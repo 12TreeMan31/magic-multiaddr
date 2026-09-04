@@ -14,6 +14,8 @@ pub enum Error {
     Overflow,
     /// Encoding is not minimal
     NotMinimal,
+    /// Catch all error
+    InvalidVarint,
 }
 
 const fn varint_length(n: u64) -> usize {
@@ -59,7 +61,7 @@ impl From<varint_decode::Error> for Error {
             varint_decode::Error::Insufficient => Error::Insufficient,
             varint_decode::Error::NotMinimal => Error::NotMinimal,
             varint_decode::Error::Overflow => Error::Overflow,
-            _ => unreachable!(),
+            _ => Error::InvalidVarint,
         }
     }
 }
@@ -107,9 +109,7 @@ impl<'a> Protocol<'a> {
             offset += varint_encode(self.value.len() as u64, &mut out[offset..])?;
         }
 
-        for (x, y) in self.value.iter().zip(out[offset..].iter_mut()) {
-            *y = *x;
-        }
+        out[offset..offset + self.value.len()].copy_from_slice(self.value);
 
         Ok(length)
     }

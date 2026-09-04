@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "magic_multiaddr"
+name = "magic-multiaddr"
 version = "0.1.0"
 dependencies = [
  "unsigned-varint",

@@ -1,6 +1,9 @@
 [package]
-name = "magic_multiaddr"
+name = "magic-multiaddr"
+repository = "https://github.com/12TreeMan31/magic-multiaddr"
 version = "0.1.0"
+license = "LGPL-2.1"
+description = "no_std implmentation of multiaddr"
 edition = "2024"
 
 [dependencies]
