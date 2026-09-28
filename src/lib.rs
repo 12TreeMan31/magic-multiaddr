@@ -1,7 +1,7 @@
 #![no_std]
 
 use core::convert::From;
-use core::iter::Iterator;
+use core::iter::{FusedIterator, Iterator};
 use core::marker::PhantomData;
 use unsigned_varint::decode as varint_decode;
 
@@ -18,6 +18,7 @@ pub enum Error {
     InvalidVarint,
 }
 
+/// Gets length in bytes `n` would be after encoding
 const fn varint_length(n: u64) -> usize {
     // Edge case where an overflow happens
     if n == 0 {
@@ -29,7 +30,10 @@ const fn varint_length(n: u64) -> usize {
     ((63 - n.leading_zeros()) / 7 + 1) as usize
 }
 
-/// Take u64 and encodes it into out, returns bytes written
+/// Encodes `n` as a uvarint and writes the result to `out`. Fails if length
+/// of `out` < `varint_length(n)`; nothing will be written to `out`.
+///
+/// On success returns number of bytes written
 fn varint_encode(mut n: u64, out: &mut [u8]) -> Result<usize, Error> {
     let length = varint_length(n);
     if length > out.len() {
@@ -66,16 +70,21 @@ impl From<varint_decode::Error> for Error {
     }
 }
 
+/// Trait that the user must implment in order to work with parsing logic
 pub trait Codec {
     /// A `Codec` takes the current protocol `code` and the raw `input` of bytes from a multiaddr.
     /// After decoding, returns the built protocal and the remaning `input` bytes.
     fn decode<'a>(code: u64, input: &'a [u8]) -> Result<(Protocol<'a>, &'a [u8]), Error>;
 }
 
+/// One protocol in a multiaddr (ex. /ip4/1.1.1.1 or /udp/1234).
+///
+/// See https://multiformats.io/multiaddr/ for more info
 pub struct Protocol<'a> {
-    pub code: u64,
-    pub length_prefix: bool,
-    pub value: &'a [u8],
+    code: u64,
+    /// False mean we know the length of the data, true means there is a size prefix on the data.
+    length_prefix: bool,
+    value: &'a [u8],
 }
 
 impl<'a> Protocol<'a> {
@@ -85,6 +94,14 @@ impl<'a> Protocol<'a> {
             length_prefix,
             value,
         }
+    }
+
+    pub fn code(&self) -> u64 {
+        self.code
+    }
+
+    pub fn value(&self) -> &[u8] {
+        self.value
     }
 
     /// Returns the number of bytes needed to encode the protocol
@@ -98,6 +115,8 @@ impl<'a> Protocol<'a> {
 
         length
     }
+
+    /// Converts self into a byte stream that can be sent over the network.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
         let length = self.encode_len();
         if length > out.len() {
@@ -115,9 +134,10 @@ impl<'a> Protocol<'a> {
     }
 }
 
+/// Iterator over protocols in a multiaddr according to a codec.
 pub struct ProtocolIter<'a, C> {
     buf: &'a [u8],
-    codec: PhantomData<C>,
+    codec: PhantomData<fn() -> C>,
 }
 
 impl<'a, C: Codec> ProtocolIter<'a, C> {
@@ -152,10 +172,12 @@ impl<'a, C: Codec> Iterator for ProtocolIter<'a, C> {
                 Some(Ok(p))
             }
             Err(e) => {
-                // Note for later we might want to keep the remainder value
+                // Note for later we might want to keep the remainder value for error recovory
                 self.buf = &[];
                 Some(Err(e))
             }
         }
     }
 }
+
+impl<'a, C: Codec> FusedIterator for ProtocolIter<'a, C> {}

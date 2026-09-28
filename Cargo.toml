@@ -1,3 +1,6 @@
+[workspace]
+members = ["example-codec"]
+
 [package]
 name = "magic-multiaddr"
 repository = "https://github.com/12TreeMan31/magic-multiaddr"
