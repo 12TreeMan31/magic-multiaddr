@@ -5,6 +5,8 @@ use core::iter::{FusedIterator, Iterator};
 use core::marker::PhantomData;
 use unsigned_varint::decode as varint_decode;
 
+pub mod text;
+
 pub enum Error {
     /// Protocol could not find expected value
     MissingValue,
@@ -15,7 +17,7 @@ pub enum Error {
     /// Encoding is not minimal
     NotMinimal,
     /// Catch all error
-    InvalidVarint,
+    Invalid,
 }
 
 /// Gets length in bytes `n` would be after encoding
@@ -65,7 +67,7 @@ impl From<varint_decode::Error> for Error {
             varint_decode::Error::Insufficient => Error::Insufficient,
             varint_decode::Error::NotMinimal => Error::NotMinimal,
             varint_decode::Error::Overflow => Error::Overflow,
-            _ => Error::InvalidVarint,
+            _ => Error::Invalid,
         }
     }
 }
