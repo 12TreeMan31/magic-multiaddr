@@ -7,6 +7,7 @@ use unsigned_varint::decode as varint_decode;
 
 pub mod text;
 
+#[derive(Debug)]
 pub enum Error {
     /// Protocol could not find expected value
     MissingValue,
