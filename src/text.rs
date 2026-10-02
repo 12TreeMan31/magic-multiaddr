@@ -4,15 +4,28 @@ use core::marker::PhantomData;
 use core::str;
 
 pub trait TextCodec {
-    fn code_from_str(input: &str) -> Result<u64, Error>;
-    fn has_value(code: u64) -> Result<bool, Error>;
+    /// Takes in a string protocol id and returns the equivalent integer code and
+    /// whether or not it requires a value field. Any error is assumed to invalite
+    /// the whole multiaddr.
+    fn token_info(input: &str) -> Result<(u64, bool), ()>;
 }
 
 pub struct TextProtocol<'a> {
-    pub code: u64,
-    pub value: Option<&'a str>,
+    code: u64,
+    value: Option<&'a str>,
 }
 
+impl<'a> TextProtocol<'a> {
+    pub fn code(&self) -> u64 {
+        self.code
+    }
+
+    pub fn value(&self) -> Option<&str> {
+        self.value
+    }
+}
+
+/// Iterator that converts a string into `TextProtocol`s
 pub struct TextIter<'a, C> {
     tokens: str::Split<'a, char>,
     done: bool,
@@ -48,18 +61,14 @@ impl<'a, C: TextCodec> Iterator for TextIter<'a, C> {
             n => n,
         };
 
-        let code = match C::code_from_str(name) {
-            Ok(x) => x,
-            Err(e) => {
-                self.done = true;
-                return Some(Err(e));
-            }
+        let Ok((code, has_value)) = C::token_info(name) else {
+            self.done = true;
+            return Some(Err(Error::Invalid));
         };
-        let value = if C::has_value(code).unwrap() {
-            // You need proper error handling here
-            Some(self.tokens.next()?)
-        } else {
-            None
+
+        let value = match has_value {
+            true => Some(self.tokens.next()?),
+            false => None,
         };
 
         Some(Ok(TextProtocol { code, value }))
@@ -74,48 +83,34 @@ mod tests {
 
     const SPEC: &[(u64, bool, &str)] = &[
         (0x04, true, "ip4"),
-        (0x29, true, "ip6"),
-        (0x06, true, "tcp"),
         (0x0111, true, "udp"),
         (0x01c0, false, "tls"),
     ];
     struct BasicCodec;
     impl TextCodec for BasicCodec {
-        fn code_from_str(input: &str) -> Result<u64, Error> {
+        fn token_info(input: &str) -> Result<(u64, bool), ()> {
             SPEC.iter()
                 .find(|(_, _, s)| *s == input)
-                .map(|(x, _, _)| *x)
-                .ok_or(Error::Insufficient)
-        }
-        fn has_value(code: u64) -> Result<bool, Error> {
-            SPEC.iter()
-                .find(|(c, _, _)| *c == code)
-                .map(|(_, f, _)| *f)
-                .ok_or(Error::Insufficient)
+                .map(|(x, y, _)| (*x, *y))
+                .ok_or(())
         }
     }
 
     #[test]
     fn basic() {
-        let addr = "/ip4/1.1.1.1";
+        let addr = "/ip4/1.1.1.1/udp/1234/tls";
         let mut iter: TextIter<'_, BasicCodec> = TextIter::new(addr);
 
         let proto = iter.next().unwrap().unwrap();
-
         assert_eq!(proto.code, 0x04);
         assert_eq!(proto.value, Some("1.1.1.1"));
-    }
 
-    #[test]
-    fn code_str() {
-        assert_eq!(
-            BasicCodec::code_from_str("ip6").expect("Not a valid code!"),
-            0x29
-        );
-    }
+        let proto = iter.next().unwrap().unwrap();
+        assert_eq!(proto.code, 0x0111);
+        assert_eq!(proto.value, Some("1234"));
 
-    #[test]
-    fn is_value() {
-        assert_eq!(BasicCodec::has_value(0x04).unwrap(), true);
+        let proto = iter.next().unwrap().unwrap();
+        assert_eq!(proto.code, 0x01c0);
+        assert_eq!(proto.value, None);
     }
 }
