@@ -6,6 +6,7 @@ use core::marker::PhantomData;
 use unsigned_varint::decode as varint_decode;
 
 pub mod text;
+pub mod v2;
 
 #[derive(Debug)]
 pub enum Error {

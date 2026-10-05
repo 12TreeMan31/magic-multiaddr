@@ -4,7 +4,7 @@ members = ["example-codec"]
 [package]
 name = "magic-multiaddr"
 repository = "https://github.com/12TreeMan31/magic-multiaddr"
-version = "0.2.0"
+version = "0.2.1"
 license = "LGPL-2.1"
 description = "no_std implmentation of multiaddr"
 edition = "2024"
