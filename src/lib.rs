@@ -1,16 +1,15 @@
-#![no_std]
-
 use core::convert::From;
 use core::iter::{FusedIterator, Iterator};
 use core::marker::PhantomData;
+use core::{error, fmt};
 use unsigned_varint::decode as varint_decode;
 
 pub mod text;
-pub mod v2;
+mod varint;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// Protocol could not find expected value
+    /// Frame value not present
     MissingValue,
     /// Not enough input bytes
     Insufficient,
@@ -18,49 +17,6 @@ pub enum Error {
     Overflow,
     /// Encoding is not minimal
     NotMinimal,
-    /// Catch all error
-    Invalid,
-}
-
-/// Gets length in bytes `n` would be after encoding
-const fn varint_length(n: u64) -> usize {
-    // Edge case where an overflow happens
-    if n == 0 {
-        return 1;
-    }
-
-    // Gets the number of goups of 7 we need counting from 0
-    // Since it starts counting at 0 we need to add 1
-    ((63 - n.leading_zeros()) / 7 + 1) as usize
-}
-
-/// Encodes `n` as a uvarint and writes the result to `out`. Fails if length
-/// of `out` < `varint_length(n)`; nothing will be written to `out`.
-///
-/// On success returns number of bytes written
-fn varint_encode(mut n: u64, out: &mut [u8]) -> Result<usize, Error> {
-    let length = varint_length(n);
-    if length > out.len() {
-        return Err(Error::Insufficient);
-    }
-
-    let mut i = 0;
-    loop {
-        // Extracts the first 7 bits
-        let b = (n & 0x7f) as u8;
-        n >>= 7;
-
-        if n == 0 {
-            out[i] = b;
-            break;
-        } else {
-            // Marks the 8th bit
-            out[i] = b | 0x80;
-            i += 1;
-        }
-    }
-
-    Ok(length)
 }
 
 impl From<varint_decode::Error> for Error {
@@ -69,72 +25,113 @@ impl From<varint_decode::Error> for Error {
             varint_decode::Error::Insufficient => Error::Insufficient,
             varint_decode::Error::NotMinimal => Error::NotMinimal,
             varint_decode::Error::Overflow => Error::Overflow,
-            _ => Error::Invalid,
+            _ => unreachable!(),
         }
     }
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::MissingValue => f.write_str("frame value not present"),
+            Error::Insufficient => f.write_str("not enough input bytes"),
+            Error::Overflow => f.write_str("input bytes exceed maximum"),
+            Error::NotMinimal => f.write_str("encoding is not minimal"),
+        }
+    }
+}
+
+impl error::Error for Error {}
+
+/// Tells the parser if a given code has an associated value
+#[derive(Debug, Clone, PartialEq)]
+pub enum FrameValue {
+    Empty,
+    Fixed(u64),
+    LengthPrefixed,
 }
 
 /// Trait that the user must implment in order to work with parsing logic
 pub trait Codec {
-    /// A `Codec` takes the current protocol `code` and the raw `input` of bytes from a multiaddr.
-    /// After decoding, returns the built protocal and the remaning `input` bytes.
-    fn decode<'a>(code: u64, input: &'a [u8]) -> Result<(Protocol<'a>, &'a [u8]), Error>;
+    type Error: From<Error>;
+
+    /// Converts a protocol code into a string
+    fn code_to_name(code: u64) -> Result<&'static str, Self::Error>;
+    /// Converts a protocol string into a code
+    fn name_to_code(name: &str) -> Result<u64, Self::Error>;
+    /// Returns the associated `FrameValue` for a given code
+    fn frame(code: u64) -> Result<FrameValue, Self::Error>;
+
+    /// Converts a human readable value `input` into a binary version `out`.
+    fn encode_value(code: u64, input: &str, out: &mut [u8]) -> Result<usize, Self::Error>;
+    /// Converts a binary value into a human readable string
+    fn decode_value(code: u64, input: &[u8], out: &mut [u8]) -> Result<usize, Self::Error>;
 }
 
-/// One protocol in a multiaddr (ex. /ip4/1.1.1.1 or /udp/1234).
+pub struct Multiaddr<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> Multiaddr<'a> {
+    pub const fn new(buf: &'a [u8]) -> Self {
+        Multiaddr { buf }
+    }
+
+    pub fn iter<C: Codec>(&self) -> ProtocolIter<'a, C> {
+        ProtocolIter::new(self.buf)
+    }
+
+    pub fn encode_text<C: Codec>(&self, out: &mut [u8]) -> Result<usize, C::Error> {
+        let mut written = 0;
+        for proto in self.iter::<C>() {
+            let proto = proto?;
+
+            let name = C::code_to_name(proto.code())?;
+
+            let buffered = written + 1 + name.len();
+            if buffered >= out.len() {
+                return Err(Error::Insufficient.into());
+            }
+
+            // Writes for example /ip4
+            out[written] = b'/';
+            written += 1;
+            out[written..written + name.len()].copy_from_slice(name.as_bytes());
+            written += name.len();
+
+            if C::frame(proto.code())? != FrameValue::Empty {
+                if written >= out.len() {
+                    return Err(Error::Insufficient.into());
+                }
+                // This would then write /1.1.1.1
+                out[written] = b'/';
+                written += 1;
+                written += C::decode_value(proto.code(), proto.value(), &mut out[written..])?;
+            }
+        }
+
+        Ok(written)
+    }
+}
+
+/// One frame in a multiaddr (ex. /ip4/1.1.1.1 or /udp/1234).
 ///
 /// See https://multiformats.io/multiaddr/ for more info
 pub struct Protocol<'a> {
     code: u64,
-    /// False mean we know the length of the data, true means there is a size prefix on the data.
-    length_prefix: bool,
     value: &'a [u8],
 }
 
 impl<'a> Protocol<'a> {
-    pub fn new(code: u64, length_prefix: bool, value: &'a [u8]) -> Self {
-        Self {
-            code,
-            length_prefix,
-            value,
-        }
+    pub(crate) const fn new(code: u64, value: &'a [u8]) -> Self {
+        Self { code, value }
     }
 
-    pub fn code(&self) -> u64 {
+    pub const fn code(&self) -> u64 {
         self.code
     }
 
-    pub fn value(&self) -> &[u8] {
+    pub const fn value(&self) -> &[u8] {
         self.value
-    }
-
-    /// Returns the number of bytes needed to encode the protocol
-    pub fn encode_len(&self) -> usize {
-        let mut length: usize = varint_length(self.code) + self.value.len();
-
-        // Length is encoded as varint. See the spec
-        if self.length_prefix {
-            length += varint_length(self.value.len() as u64);
-        }
-
-        length
-    }
-
-    /// Converts self into a byte stream that can be sent over the network.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
-        let length = self.encode_len();
-        if length > out.len() {
-            return Err(Error::Insufficient);
-        }
-
-        let mut offset = varint_encode(self.code, out)?;
-        if self.length_prefix {
-            offset += varint_encode(self.value.len() as u64, &mut out[offset..])?;
-        }
-
-        out[offset..offset + self.value.len()].copy_from_slice(self.value);
-
-        Ok(length)
     }
 }
 
@@ -145,7 +142,7 @@ pub struct ProtocolIter<'a, C> {
 }
 
 impl<'a, C: Codec> ProtocolIter<'a, C> {
-    pub fn new(buf: &'a [u8]) -> Self {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self {
             buf,
             codec: PhantomData,
@@ -154,34 +151,175 @@ impl<'a, C: Codec> ProtocolIter<'a, C> {
 }
 
 impl<'a, C: Codec> Iterator for ProtocolIter<'a, C> {
-    type Item = Result<Protocol<'a>, Error>;
+    type Item = Result<Protocol<'a>, C::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.buf.is_empty() {
             return None;
         }
 
-        let (code, remaining) = match varint_decode::u64(self.buf) {
+        let (code, mut remaining) = match varint_decode::u64(self.buf) {
             Ok((c, r)) => (c, r),
             Err(e) => {
                 // Clears the buffer to stop the iterator on next call
                 self.buf = &[];
+                let e: Error = e.into();
                 return Some(Err(e.into()));
             }
         };
 
-        match C::decode(code, remaining) {
-            Ok((p, buf)) => {
-                self.buf = buf;
-                Some(Ok(p))
+        let frame = match C::frame(code) {
+            Ok(f) => f,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let length: usize = match frame {
+            FrameValue::Empty => 0,
+            FrameValue::Fixed(n) => n as usize,
+            FrameValue::LengthPrefixed => {
+                let (n, r) = match varint_decode::u64(remaining) {
+                    Ok((n, r)) => (n, r),
+                    Err(e) => {
+                        self.buf = &[];
+                        let e: Error = e.into();
+                        return Some(Err(e.into()));
+                    }
+                };
+                remaining = r;
+                n as usize
             }
-            Err(e) => {
-                // Note for later we might want to keep the remainder value for error recovory
+        };
+
+        match remaining.get(..length) {
+            Some(v) => {
+                self.buf = &remaining[length..];
+                Some(Ok(Protocol::new(code, v)))
+            }
+            None => {
                 self.buf = &[];
-                Some(Err(e))
+                Some(Err(Error::MissingValue.into()))
             }
         }
     }
 }
 
 impl<'a, C: Codec> FusedIterator for ProtocolIter<'a, C> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::format;
+    use std::string::String;
+
+    const IP4: u64 = 0x04;
+    const UDP: u64 = 0x0111;
+    const DNS: u64 = 0x35;
+    const TLS: u64 = 0x01c0;
+
+    const LOOKUP: &[(u64, FrameValue, &str)] = &[
+        (IP4, FrameValue::Fixed(4), "ip4"),
+        (UDP, FrameValue::Fixed(2), "udp"),
+        (DNS, FrameValue::LengthPrefixed, "dns"),
+        (TLS, FrameValue::Empty, "tls"),
+    ];
+
+    struct TestCodec;
+
+    impl Codec for TestCodec {
+        type Error = Error;
+
+        fn code_to_name(code: u64) -> Result<&'static str, Self::Error> {
+            LOOKUP
+                .iter()
+                .find(|(c, _, _)| *c == code)
+                .map(|(_, _, n)| *n)
+                .ok_or(Error::MissingValue)
+        }
+
+        fn name_to_code(name: &str) -> Result<u64, Self::Error> {
+            LOOKUP
+                .iter()
+                .find(|(_, _, n)| *n == name)
+                .map(|(c, _, _)| *c)
+                .ok_or(Error::MissingValue)
+        }
+
+        fn frame(code: u64) -> Result<FrameValue, Self::Error> {
+            LOOKUP
+                .iter()
+                .find(|(c, _, _)| *c == code)
+                .map(|(_, f, _)| f.clone())
+                .ok_or(Error::MissingValue)
+        }
+
+        fn encode_value(code: u64, input: &str, out: &mut [u8]) -> Result<usize, Self::Error> {
+            match code {
+                IP4 => {
+                    let mut buf = [0u8; 4];
+                    let mut parts = input.split('.');
+                    for slot in &mut buf {
+                        *slot = parts
+                            .next()
+                            .ok_or(Error::MissingValue)?
+                            .parse()
+                            .map_err(|_| Error::MissingValue)?;
+                    }
+                    if parts.next().is_some() {
+                        return Err(Error::MissingValue);
+                    }
+                    if out.len() < 4 {
+                        return Err(Error::Insufficient);
+                    }
+                    out[..4].copy_from_slice(&buf);
+                    Ok(4)
+                }
+                UDP => {
+                    let n: u16 = input.parse().map_err(|_| Error::MissingValue)?;
+                    if out.len() < 2 {
+                        return Err(Error::Insufficient);
+                    }
+                    out[..2].copy_from_slice(&n.to_be_bytes());
+                    Ok(2)
+                }
+                DNS => {
+                    let b = input.as_bytes();
+                    if out.len() < b.len() {
+                        return Err(Error::Insufficient);
+                    }
+                    out[..b.len()].copy_from_slice(b);
+                    Ok(b.len())
+                }
+                TLS => Ok(0),
+                _ => Err(Error::MissingValue),
+            }
+        }
+
+        fn decode_value(code: u64, input: &[u8], out: &mut [u8]) -> Result<usize, Self::Error> {
+            // Render binary value to text using format!, then copy.
+            let s: String = match code {
+                IP4 => {
+                    if input.len() != 4 {
+                        return Err(Error::MissingValue);
+                    }
+                    format!("{}.{}.{}.{}", input[0], input[1], input[2], input[3])
+                }
+                UDP => {
+                    if input.len() != 2 {
+                        return Err(Error::MissingValue);
+                    }
+                    format!("{}", u16::from_be_bytes([input[0], input[1]]))
+                }
+                DNS => std::str::from_utf8(input)
+                    .map_err(|_| Error::MissingValue)?
+                    .to_string(),
+                TLS => String::new(),
+                _ => return Err(Error::MissingValue),
+            };
+            if out.len() < s.len() {
+                return Err(Error::Insufficient);
+            }
+            out[..s.len()].copy_from_slice(s.as_bytes());
+            Ok(s.len())
+        }
+    }
+}

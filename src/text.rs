@@ -1,13 +1,50 @@
-use crate::Error;
+use crate::varint;
+use crate::{Codec, Error, FrameValue};
 use core::iter::{FusedIterator, Iterator};
 use core::marker::PhantomData;
 use core::str;
 
-pub trait TextCodec {
-    /// Takes in a string protocol id and returns the equivalent integer code and
-    /// whether or not it requires a value field. Any error is assumed to invalite
-    /// the whole multiaddr.
-    fn token_info(input: &str) -> Result<(u64, bool), ()>;
+pub struct TextMultiaddr<'a> {
+    buf: &'a str,
+}
+
+impl<'a> TextMultiaddr<'a> {
+    pub const fn new(buf: &'a str) -> Self {
+        TextMultiaddr { buf }
+    }
+
+    pub fn iter<C: Codec>(&self) -> TextIter<'a, C> {
+        TextIter::new(self.buf)
+    }
+
+    pub fn decode_text<C: Codec>(&self, out: &mut [u8]) -> Result<usize, C::Error> {
+        let mut written = 0;
+        for proto in self.iter::<C>() {
+            let proto = proto?;
+
+            let length = varint::varint_length(proto.code());
+            varint::varint_encode(proto.code(), &mut out[written..])?;
+            written += length;
+
+            let Some(value) = proto.value() else {
+                continue;
+            };
+
+            let bytes = C::encode_value(proto.code(), value, &mut out[written..])?;
+            let frame = C::frame(proto.code())?;
+
+            if frame == FrameValue::LengthPrefixed {
+                let length = varint::varint_length(bytes as u64);
+                out.copy_within(written..written + bytes, written + length);
+                varint::varint_encode(bytes as u64, &mut out[written..written + length])?;
+                written += length;
+            }
+
+            written += bytes;
+        }
+
+        Ok(written)
+    }
 }
 
 pub struct TextProtocol<'a> {
@@ -16,6 +53,10 @@ pub struct TextProtocol<'a> {
 }
 
 impl<'a> TextProtocol<'a> {
+    pub(crate) const fn new(code: u64, value: Option<&'a str>) -> Self {
+        Self { code, value }
+    }
+
     pub fn code(&self) -> u64 {
         self.code
     }
@@ -32,7 +73,7 @@ pub struct TextIter<'a, C> {
     codec: PhantomData<fn() -> C>,
 }
 
-impl<'a, C: TextCodec> TextIter<'a, C> {
+impl<'a, C: Codec> TextIter<'a, C> {
     pub fn new(multiaddr: &'a str) -> Self {
         let mut tokens = multiaddr.split('/');
         // Gets ride of the first / in a multiaddr
@@ -48,8 +89,8 @@ impl<'a, C: TextCodec> TextIter<'a, C> {
     }
 }
 
-impl<'a, C: TextCodec> Iterator for TextIter<'a, C> {
-    type Item = Result<TextProtocol<'a>, Error>;
+impl<'a, C: Codec> Iterator for TextIter<'a, C> {
+    type Item = Result<TextProtocol<'a>, C::Error>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
@@ -57,60 +98,32 @@ impl<'a, C: TextCodec> Iterator for TextIter<'a, C> {
 
         // Look into replacing this call with fuse
         let name = match self.tokens.next()? {
-            "" => return Some(Err(Error::NotMinimal)),
+            "" => return Some(Err(Error::NotMinimal.into())),
             n => n,
         };
 
-        let Ok((code, has_value)) = C::token_info(name) else {
+        let Ok(code) = C::name_to_code(name) else {
             self.done = true;
-            return Some(Err(Error::Invalid));
+            return Some(Err(Error::MissingValue.into()));
         };
+
+        let frame = match C::frame(code) {
+            Ok(f) => f,
+            Err(e) => {
+                self.done = true;
+                return Some(Err(e));
+            }
+        };
+
+        let has_value = frame != FrameValue::Empty;
 
         let value = match has_value {
             true => Some(self.tokens.next()?),
             false => None,
         };
 
-        Some(Ok(TextProtocol { code, value }))
+        Some(Ok(TextProtocol::new(code, value)))
     }
 }
 
-impl<'a, C: TextCodec> FusedIterator for TextIter<'a, C> {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SPEC: &[(u64, bool, &str)] = &[
-        (0x04, true, "ip4"),
-        (0x0111, true, "udp"),
-        (0x01c0, false, "tls"),
-    ];
-    struct BasicCodec;
-    impl TextCodec for BasicCodec {
-        fn token_info(input: &str) -> Result<(u64, bool), ()> {
-            SPEC.iter()
-                .find(|(_, _, s)| *s == input)
-                .map(|(x, y, _)| (*x, *y))
-                .ok_or(())
-        }
-    }
-
-    #[test]
-    fn basic() {
-        let addr = "/ip4/1.1.1.1/udp/1234/tls";
-        let mut iter: TextIter<'_, BasicCodec> = TextIter::new(addr);
-
-        let proto = iter.next().unwrap().unwrap();
-        assert_eq!(proto.code, 0x04);
-        assert_eq!(proto.value, Some("1.1.1.1"));
-
-        let proto = iter.next().unwrap().unwrap();
-        assert_eq!(proto.code, 0x0111);
-        assert_eq!(proto.value, Some("1234"));
-
-        let proto = iter.next().unwrap().unwrap();
-        assert_eq!(proto.code, 0x01c0);
-        assert_eq!(proto.value, None);
-    }
-}
+impl<'a, C: Codec> FusedIterator for TextIter<'a, C> {}
