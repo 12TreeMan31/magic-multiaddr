@@ -197,8 +197,6 @@ impl<'a, C: Codec> FusedIterator for ProtocolIter<'a, C> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::format;
-    use std::string::String;
 
     const IP4: u64 = 0x04;
     const UDP: u64 = 0x0111;
