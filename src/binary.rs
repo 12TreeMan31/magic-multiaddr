@@ -2,6 +2,7 @@ use crate::*;
 use core::iter::{FusedIterator, Iterator};
 use core::marker::PhantomData;
 
+/// Containter for the binary data that makes up a multiaddr.
 pub struct Multiaddr<'a> {
     buf: &'a [u8],
 }
@@ -15,6 +16,8 @@ impl<'a> Multiaddr<'a> {
         ProtocolIter::new(self.buf)
     }
 
+    /// Uses `Codec` to parse the given multiaddr into the `out` buffer. The buffer will then contain a human readable version
+    /// of the multiaddr. Returns the number of bytes written on success.
     pub fn encode_text<C: Codec>(&self, out: &mut [u8]) -> Result<usize, C::Error> {
         let mut written = 0;
         for proto in self.iter::<C>() {

@@ -13,7 +13,6 @@ pub enum Error {
     Insufficient,
     /// Input bytes exceed maximum
     Overflow,
-    /// Encoding is not minimal
     NotMinimal,
 }
 
