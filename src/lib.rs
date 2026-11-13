@@ -2,7 +2,6 @@ use core::convert::From;
 use core::iter::{FusedIterator, Iterator};
 use core::marker::PhantomData;
 use core::{error, fmt};
-use unsigned_varint::decode as varint_decode;
 
 pub mod text;
 mod varint;
@@ -19,16 +18,6 @@ pub enum Error {
     NotMinimal,
 }
 
-impl From<varint_decode::Error> for Error {
-    fn from(value: varint_decode::Error) -> Self {
-        match value {
-            varint_decode::Error::Insufficient => Error::Insufficient,
-            varint_decode::Error::NotMinimal => Error::NotMinimal,
-            varint_decode::Error::Overflow => Error::Overflow,
-            _ => unreachable!(),
-        }
-    }
-}
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -158,7 +147,7 @@ impl<'a, C: Codec> Iterator for ProtocolIter<'a, C> {
             return None;
         }
 
-        let (code, mut remaining) = match varint_decode::u64(self.buf) {
+        let (code, mut remaining) = match varint::varint_decode(self.buf) {
             Ok((c, r)) => (c, r),
             Err(e) => {
                 // Clears the buffer to stop the iterator on next call
@@ -177,7 +166,7 @@ impl<'a, C: Codec> Iterator for ProtocolIter<'a, C> {
             FrameValue::Empty => 0,
             FrameValue::Fixed(n) => n as usize,
             FrameValue::LengthPrefixed => {
-                let (n, r) = match varint_decode::u64(remaining) {
+                let (n, r) = match varint::varint_decode(remaining) {
                     Ok((n, r)) => (n, r),
                     Err(e) => {
                         self.buf = &[];

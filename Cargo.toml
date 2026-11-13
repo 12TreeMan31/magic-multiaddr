@@ -7,4 +7,3 @@ description = "no_std implmentation of multiaddr"
 edition = "2024"
 
 [dependencies]
-unsigned-varint = "0.8.0"
