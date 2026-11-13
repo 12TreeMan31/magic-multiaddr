@@ -1,8 +1,7 @@
 use core::convert::From;
-use core::iter::{FusedIterator, Iterator};
-use core::marker::PhantomData;
 use core::{error, fmt};
 
+pub mod binary;
 pub mod text;
 mod varint;
 
@@ -32,7 +31,7 @@ impl fmt::Display for Error {
 impl error::Error for Error {}
 
 /// Tells the parser if a given code has an associated value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameValue {
     Empty,
     Fixed(u64),
@@ -56,147 +55,14 @@ pub trait Codec {
     fn decode_value(code: u64, input: &[u8], out: &mut [u8]) -> Result<usize, Self::Error>;
 }
 
-pub struct Multiaddr<'a> {
-    buf: &'a [u8],
-}
-
-impl<'a> Multiaddr<'a> {
-    pub const fn new(buf: &'a [u8]) -> Self {
-        Multiaddr { buf }
-    }
-
-    pub fn iter<C: Codec>(&self) -> ProtocolIter<'a, C> {
-        ProtocolIter::new(self.buf)
-    }
-
-    pub fn encode_text<C: Codec>(&self, out: &mut [u8]) -> Result<usize, C::Error> {
-        let mut written = 0;
-        for proto in self.iter::<C>() {
-            let proto = proto?;
-
-            let name = C::code_to_name(proto.code())?;
-
-            let buffered = written + 1 + name.len();
-            if buffered >= out.len() {
-                return Err(Error::Insufficient.into());
-            }
-
-            // Writes for example /ip4
-            out[written] = b'/';
-            written += 1;
-            out[written..written + name.len()].copy_from_slice(name.as_bytes());
-            written += name.len();
-
-            if C::frame(proto.code())? != FrameValue::Empty {
-                if written >= out.len() {
-                    return Err(Error::Insufficient.into());
-                }
-                // This would then write /1.1.1.1
-                out[written] = b'/';
-                written += 1;
-                written += C::decode_value(proto.code(), proto.value(), &mut out[written..])?;
-            }
-        }
-
-        Ok(written)
-    }
-}
-
-/// One frame in a multiaddr (ex. /ip4/1.1.1.1 or /udp/1234).
-///
-/// See https://multiformats.io/multiaddr/ for more info
-pub struct Protocol<'a> {
-    code: u64,
-    value: &'a [u8],
-}
-
-impl<'a> Protocol<'a> {
-    pub(crate) const fn new(code: u64, value: &'a [u8]) -> Self {
-        Self { code, value }
-    }
-
-    pub const fn code(&self) -> u64 {
-        self.code
-    }
-
-    pub const fn value(&self) -> &[u8] {
-        self.value
-    }
-}
-
-/// Iterator over protocols in a multiaddr according to a codec.
-pub struct ProtocolIter<'a, C> {
-    buf: &'a [u8],
-    codec: PhantomData<fn() -> C>,
-}
-
-impl<'a, C: Codec> ProtocolIter<'a, C> {
-    pub(crate) fn new(buf: &'a [u8]) -> Self {
-        Self {
-            buf,
-            codec: PhantomData,
-        }
-    }
-}
-
-impl<'a, C: Codec> Iterator for ProtocolIter<'a, C> {
-    type Item = Result<Protocol<'a>, C::Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.buf.is_empty() {
-            return None;
-        }
-
-        let (code, mut remaining) = match varint::varint_decode(self.buf) {
-            Ok((c, r)) => (c, r),
-            Err(e) => {
-                // Clears the buffer to stop the iterator on next call
-                self.buf = &[];
-                let e: Error = e.into();
-                return Some(Err(e.into()));
-            }
-        };
-
-        let frame = match C::frame(code) {
-            Ok(f) => f,
-            Err(e) => return Some(Err(e)),
-        };
-
-        let length: usize = match frame {
-            FrameValue::Empty => 0,
-            FrameValue::Fixed(n) => n as usize,
-            FrameValue::LengthPrefixed => {
-                let (n, r) = match varint::varint_decode(remaining) {
-                    Ok((n, r)) => (n, r),
-                    Err(e) => {
-                        self.buf = &[];
-                        let e: Error = e.into();
-                        return Some(Err(e.into()));
-                    }
-                };
-                remaining = r;
-                n as usize
-            }
-        };
-
-        match remaining.get(..length) {
-            Some(v) => {
-                self.buf = &remaining[length..];
-                Some(Ok(Protocol::new(code, v)))
-            }
-            None => {
-                self.buf = &[];
-                Some(Err(Error::MissingValue.into()))
-            }
-        }
-    }
-}
-
-impl<'a, C: Codec> FusedIterator for ProtocolIter<'a, C> {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binary::*;
+    use crate::text::*;
+
+    use std::assert_matches;
+    use std::sync::LazyLock;
 
     const IP4: u64 = 0x04;
     const UDP: u64 = 0x0111;
@@ -308,5 +174,121 @@ mod tests {
             out[..s.len()].copy_from_slice(s.as_bytes());
             Ok(s.len())
         }
+    }
+
+    static SAMPLE_ADDR: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        let addr = TextMultiaddr::new("/ip4/192.168.1.1/udp/8080/dns/example.com/tls");
+
+        let mut buf = vec![0u8; 1024];
+
+        let bytes = addr
+            .decode_text::<TestCodec>(&mut buf)
+            .expect("Unable to create sample data!");
+
+        buf.truncate(bytes);
+        buf
+    });
+
+    #[test]
+    fn iterate_multiple_protocols() {
+        let mut iter = Multiaddr::new(&SAMPLE_ADDR).iter::<TestCodec>();
+
+        let ip4 = iter.next().unwrap().unwrap();
+        assert_eq!(ip4.code(), IP4);
+        assert_eq!(ip4.value(), &[192, 168, 1, 1]);
+
+        let udp = iter.next().unwrap().unwrap();
+        assert_eq!(udp.code(), UDP);
+        assert_eq!(udp.value(), &[0x1F, 0x90]);
+
+        let dns = iter.next().unwrap().unwrap();
+        assert_eq!(dns.code(), DNS);
+        assert_eq!(dns.value(), b"example.com");
+
+        let tls = iter.next().unwrap().unwrap();
+        assert_eq!(tls.code(), TLS);
+        assert_eq!(tls.value(), &[]);
+
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn missing_fixed_value() {
+        let buf = [IP4 as u8, 192, 168, 1];
+
+        let mut iter = Multiaddr::new(&buf).iter::<TestCodec>();
+
+        assert_matches!(iter.next(), Some(Err(Error::MissingValue)));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn missing_length_prefix() {
+        let buf = [DNS as u8];
+
+        let mut iter = Multiaddr::new(&buf).iter::<TestCodec>();
+
+        assert_matches!(iter.next(), Some(Err(Error::Insufficient)));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn truncated_length_prefixed_value() {
+        let buf = [DNS as u8, 3, b'a', b'b'];
+
+        let mut iter = Multiaddr::new(&buf).iter::<TestCodec>();
+
+        assert_matches!(iter.next(), Some(Err(Error::MissingValue)));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn unknown_protocol() {
+        let buf = [0x7F];
+
+        let mut iter = Multiaddr::new(&buf).iter::<TestCodec>();
+
+        assert_matches!(iter.next(), Some(Err(Error::MissingValue)));
+        assert!(iter.next().is_none());
+    }
+
+    // Text encoding
+
+    #[test]
+    fn encode_full_text() {
+        let expected = b"/ip4/192.168.1.1/udp/8080/dns/example.com/tls";
+
+        let mut out = [0u8; 128];
+
+        let written = Multiaddr::new(&SAMPLE_ADDR)
+            .encode_text::<TestCodec>(&mut out)
+            .unwrap();
+
+        assert_eq!(written, expected.len());
+        assert_eq!(&out[..written], expected);
+    }
+
+    #[test]
+    fn encode_text_exact_buffer() {
+        let expected = b"/tls";
+        let mut out = [0u8; 4];
+
+        let written = Multiaddr::new(&[0xC0, 0x03])
+            .encode_text::<TestCodec>(&mut out)
+            .unwrap();
+
+        assert_eq!(written, expected.len());
+        assert_eq!(&out, expected);
+    }
+
+    #[test]
+    fn encode_text_insufficient_buffer() {
+        let mut out = [0u8; 3];
+
+        assert_eq!(
+            Multiaddr::new(&[0xC0, 0x03]).encode_text::<TestCodec>(&mut out),
+            Err(Error::Insufficient)
+        );
     }
 }
